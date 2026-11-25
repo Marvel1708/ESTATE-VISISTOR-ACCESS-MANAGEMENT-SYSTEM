@@ -17,7 +17,7 @@ export const getDefaultEstate = async () => {
 export const normalizePhone = (phone) => {
   if (!phone) return '';
   let cleaned = phone.toString().trim().replace(/[\s\-()]/g, '');
-
+  
   if (cleaned.startsWith('+234')) return cleaned;
   if (cleaned.startsWith('234') && cleaned.length === 13) return '+' + cleaned;
   if (cleaned.startsWith('0') && cleaned.length === 11) return '+234' + cleaned.slice(1);
@@ -25,7 +25,7 @@ export const normalizePhone = (phone) => {
   return cleaned;
 };
 
-// 6-character uppercase alphanumeric code (no 0, O, 1, or I)
+// 6-character uppercase alphanumeric code 
 export const generatePassCode = () => {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
