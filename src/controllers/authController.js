@@ -171,3 +171,51 @@ export const verifyOtp = async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 };
+
+// 5. RESET PASSWORD USING OTP
+export const resetPassword = async (req, res) => {
+  try {
+    const { phoneNumber, otpCode, newPassword, confirmPassword } = req.body;
+
+    if (!phoneNumber || !otpCode || !newPassword) {
+      return res.status(400).json({ message: 'Phone number, OTP code, and new password are required.' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ message: 'New password must be at least 6 characters long.' });
+    }
+
+    if (confirmPassword && newPassword !== confirmPassword) {
+      return res.status(400).json({ message: 'Passwords do not match.' });
+    }
+
+    const normalizedPhone = normalizePhone(phoneNumber);
+
+    const user = await prisma.user.findFirst({
+      where: {
+        phoneNumber: normalizedPhone,
+        otpCode,
+        otpExpires: { gt: new Date() },
+      },
+    });
+
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid or expired OTP code.' });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        password: hashedPassword,
+        otpCode: null,
+        otpExpires: null,
+      },
+    });
+
+    res.json({ message: 'Password reset successful! You can now log in with your new password.' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};

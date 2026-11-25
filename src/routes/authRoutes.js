@@ -7,5 +7,6 @@ router.post('/register', register, validateRegister);
 router.post('/login', login, validateLogin);
 router.post('/otp/send', sendOtp);
 router.post('/otp/verify', verifyOtp);
+router.post('/reset-password', resetPassword);
 
 export default router;
