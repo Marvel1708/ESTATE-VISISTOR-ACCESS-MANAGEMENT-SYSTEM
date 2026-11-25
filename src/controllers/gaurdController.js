@@ -1,34 +1,32 @@
-import crypto from 'crypto';
 import prisma from '../config/db.js';
+import {
+  getDefaultEstate,
+  normalizePhone,
+  generatePassCode,
+  signQrPayload,
+  verifyQrPayload,
+} from '../utils/helpers.js';
 
 const TZ = 'Africa/Lagos';
-const WALKIN_TTL_MINUTES = 10;
+const WALKIN_TTL_SECONDS = 60; 
 
 const dayKey = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(d);
 const startOfTodayLagos = () => new Date(`${dayKey(new Date())}T00:00:00+01:00`);
 
-const normPhone = (p = '') => {
-  let d = String(p).replace(/\D/g, '');
-  if (d.startsWith('234')) d = '0' + d.slice(3);
-  if (d.length === 10) d = '0' + d;
-  return d;
-};
-const phoneVariants = (p) => {
-  const local = normPhone(p);
-  if (!local) return [];
-  const intl = '234' + local.slice(1);
-  return [local, intl, '+' + intl];
-};
-const last10 = (p = '') => String(p).replace(/\D/g, '').slice(-10);
+const isBlocked = async (phone, houseId = null) => {
+  const normalized = normalizePhone(phone);
+  if (!normalized) return null;
 
-const isBlocked = (phone) => {
-  const variants = phoneVariants(phone);
-  if (!variants.length) return null;
-  return prisma.blockedVisitor.findFirst({ where: { phoneNumber: { in: variants } } });
+  return prisma.blockedVisitor.findFirst({
+    where: {
+      phoneNumber: normalized,
+      OR: [
+        { scope: 'ESTATE' },
+        ...(houseId ? [{ scope: 'HOUSE', houseId }] : []),
+      ],
+    },
+  });
 };
-
-const getSettings = () =>
-  prisma.estateSetting.upsert({ where: { id: 1 }, update: {}, create: { id: 1 } });
 
 const extractToken = (raw) => {
   const s = String(raw || '').trim();
@@ -48,34 +46,44 @@ const notify = (req, userId, event, payload) => {
   if (io) io.to(`user:${userId}`).emit(event, payload);
 };
 
-const evaluatePass = async (pass) => {
-  if (await isBlocked(pass.visitorPhone)) return 'blocked';
-  switch (pass.status) {
-    case 'INSIDE': return 'already_inside';
-    case 'EXITED': return 'used';
-    case 'REJECTED': return 'rejected';
-    case 'EXPIRED': return 'expired';
-    default: break;
-  }
-  if (pass.expiresAt < new Date()) {
+// Evaluates pass validity 
+const evaluatePass = async (pass, estateId) => {
+  if (pass.estateId !== estateId) return 'WRONG_ESTATE';
+  if (await isBlocked(pass.visitorPhone, pass.resident?.houseId)) return 'BLOCKED';
+
+  if (pass.status === 'INSIDE' || pass.status === 'EXITED') return 'ALREADY_USED';
+  if (pass.status === 'CANCELLED' || pass.status === 'REJECTED') return 'NOT_FOUND';
+
+  const now = new Date();
+  if (now < new Date(pass.validFrom)) return 'NOT_YET_VALID';
+
+  if (now > new Date(pass.validTo) || pass.status === 'EXPIRED') {
     await prisma.visitorPass.updateMany({
       where: { id: pass.id, status: { in: ['ACTIVE', 'PENDING'] } },
       data: { status: 'EXPIRED' },
     });
-    return 'expired';
+    return 'EXPIRED';
   }
   return null;
 };
 
-const residentSelect = { id: true, fullName: true, phoneNumber: true, houseNumber: true };
+const residentSelect = {
+  id: true,
+  fullName: true,
+  phoneNumber: true,
+  houseNumber: true,
+  houseId: true,
+};
 
 const passView = (p) => ({
   id: p.id,
+  passCode: p.passCode,
   visitorName: p.visitorName,
   visitorPhone: p.visitorPhone,
   purpose: p.purpose,
   visitDateTime: p.visitDateTime,
-  expiresAt: p.expiresAt,
+  validFrom: p.validFrom,
+  validTo: p.validTo,
   status: p.status,
   resident: p.resident && {
     name: p.resident.fullName,
@@ -84,272 +92,328 @@ const passView = (p) => ({
   },
 });
 
+// 1. VERIFY PASS (Supports both signed QR JWT and 6-char manual code)
 export const verifyPass = async (req, res) => {
-  const token = extractToken(req.body.code);
-  if (!token) return res.status(400).json({ success: false, message: 'Code is required' });
+  try {
+    const rawCode = extractToken(req.body.code || req.body.qrToken || req.body.passCode);
+    if (!rawCode) {
+      return res.status(400).json({ success: false, message: 'QR token or pass code is required.' });
+    }
 
-  const pass = await prisma.visitorPass.findUnique({
-    where: { qrToken: token },
-    include: { resident: { select: residentSelect } },
-  });
-  if (!pass) return res.json({ success: true, valid: false, reason: 'not_found' });
+    const estate = await getDefaultEstate();
+    let pass = null;
 
-  const reason = await evaluatePass(pass);
-  const settings = await getSettings();
+    if (rawCode.length === 6) {
+      pass = await prisma.visitorPass.findUnique({
+        where: { passCode: rawCode.toUpperCase() },
+        include: { resident: { select: residentSelect } },
+      });
+    } else {
+      let decoded;
+      try {
+        decoded = verifyQrPayload(rawCode);
+      } catch (err) {
+        return res.json({
+          success: true,
+          valid: false,
+          reason: err.name === 'TokenExpiredError' ? 'EXPIRED' : 'NOT_FOUND',
+        });
+      }
 
-  res.json({
-    success: true,
-    valid: !reason,
-    reason,
-    awaitingApproval: !reason && pass.status === 'PENDING',
-    requiresApproval: !reason && settings.requireResidentApprovalAtGate && pass.status === 'ACTIVE',
-    pass: passView(pass),
-  });
+      if (decoded.estateId && decoded.estateId !== estate.id) {
+        return res.json({ success: true, valid: false, reason: 'WRONG_ESTATE' });
+      }
+
+      pass = await prisma.visitorPass.findUnique({
+        where: { id: decoded.passId },
+        include: { resident: { select: residentSelect } },
+      });
+    }
+
+    if (!pass || pass.status === 'CANCELLED' || pass.status === 'REJECTED') {
+      return res.json({ success: true, valid: false, reason: 'NOT_FOUND' });
+    }
+
+    const reason = await evaluatePass(pass, estate.id);
+
+    // Rule #5: Name-only match gives a warning, NOT a hard block
+    const nameMatch = !reason
+      ? await prisma.blockedVisitor.findFirst({
+          where: {
+            estateId: estate.id,
+            fullName: { equals: pass.visitorName, mode: 'insensitive' },
+          },
+        })
+      : null;
+
+    res.json({
+      success: true,
+      valid: !reason,
+      reason,
+      possibleMatchWarning: Boolean(nameMatch),
+      warningMessage: nameMatch
+        ? `Possible name match on blocklist (${nameMatch.fullName}) — phone did not match.`
+        : null,
+      awaitingApproval: !reason && pass.status === 'PENDING',
+      requiresApproval: !reason && estate.requireResidentApprovalAtGate && pass.status === 'ACTIVE',
+      pass: passView(pass),
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
 };
 
+// 2. REQUEST PERMISSION AT GATE
 export const requestPermission = async (req, res) => {
-  const pass = await prisma.visitorPass.findUnique({
-    where: { id: req.params.id },
-    include: { resident: { select: residentSelect } },
-  });
-  if (!pass) return res.status(404).json({ success: false, message: 'Pass not found' });
-
-  const reason = await evaluatePass(pass);
-  if (reason) return res.status(422).json({ success: false, valid: false, reason });
-  if (pass.status === 'PENDING') {
-    return res.status(409).json({ success: false, message: 'Permission already requested' });
-  }
-
-  await prisma.visitorPass.update({ where: { id: pass.id }, data: { status: 'PENDING' } });
-
-  notify(req, pass.residentId, 'arrival:request', {
-    passId: pass.id,
-    visitorName: pass.visitorName,
-    message: `Your visitor, ${pass.visitorName}, has arrived at the estate entrance. Do you authorize entry?`,
-  });
-
-  res.json({ success: true, status: 'PENDING' });
-};
-
-export const getApprovalStatus = async (req, res) => {
-  const pass = await prisma.visitorPass.findUnique({
-    where: { id: req.params.id },
-    select: { id: true, status: true, expiresAt: true },
-  });
-  if (!pass) return res.status(404).json({ success: false, message: 'Pass not found' });
-
-  if (pass.status === 'PENDING' && pass.expiresAt < new Date()) {
-    await prisma.visitorPass.update({ where: { id: pass.id }, data: { status: 'EXPIRED' } });
-    pass.status = 'EXPIRED';
-  }
-  res.json({ success: true, status: pass.status });
-};
-
-export const confirmEntry = async (req, res) => {
-  const pass = await prisma.visitorPass.findUnique({
-    where: { id: String(req.body.passId || '') },
-  });
-  if (!pass) return res.status(404).json({ success: false, message: 'Pass not found' });
-
-  const reason = await evaluatePass(pass);
-  if (reason) return res.status(422).json({ success: false, valid: false, reason });
-
-  if (pass.status === 'PENDING') {
-    return res.status(403).json({
-      success: false,
-      reason: 'awaiting_approval',
-      message: 'Resident has not approved this visitor yet',
+  try {
+    const estate = await getDefaultEstate();
+    const pass = await prisma.visitorPass.findUnique({
+      where: { id: req.params.id },
+      include: { resident: { select: residentSelect } },
     });
-  }
+    if (!pass) return res.status(404).json({ success: false, message: 'Pass not found' });
 
-  const log = await prisma.$transaction(async (tx) => {
-    const claimed = await tx.visitorPass.updateMany({
-      where: { id: pass.id, status: 'ACTIVE' },
-      data: { status: 'INSIDE' },
-    });
-    if (claimed.count === 0) return null;
-    return tx.accessLog.create({
-      data: {
-        passId: pass.id,
-        guardId: req.user.id,
-        visitorName: pass.visitorName,
-        action: 'IN',
-      },
-    });
-  });
-  if (!log) return res.status(409).json({ success: false, reason: 'already_processed' });
+    const reason = await evaluatePass(pass, estate.id);
+    if (reason) return res.status(422).json({ success: false, valid: false, reason });
 
-  notify(req, pass.residentId, 'visitor:entered', {
-    passId: pass.id,
-    visitorName: pass.visitorName,
-    timestamp: log.timestamp,
-  });
+    if (pass.status === 'PENDING') {
+      return res.status(409).json({ success: false, message: 'Permission already requested' });
+    }
 
-  res.status(201).json({ success: true, log });
-};
+    await prisma.visitorPass.update({ where: { id: pass.id }, data: { status: 'PENDING' } });
 
-export const logExit = async (req, res) => {
-  const pass = await prisma.visitorPass.findUnique({ where: { id: req.params.passId } });
-  if (!pass) return res.status(404).json({ success: false, message: 'Pass not found' });
-
-  const log = await prisma.$transaction(async (tx) => {
-    const claimed = await tx.visitorPass.updateMany({
-      where: { id: pass.id, status: 'INSIDE' },
-      data: { status: 'EXITED' },
-    });
-    if (claimed.count === 0) return null;
-    return tx.accessLog.create({
-      data: {
-        passId: pass.id,
-        guardId: req.user.id,
-        visitorName: pass.visitorName,
-        action: 'OUT',
-      },
-    });
-  });
-  if (!log) {
-    return res.status(409).json({
-      success: false,
-      message: 'This visitor is not currently inside the estate',
-    });
-  }
-
-  notify(req, pass.residentId, 'visitor:exited', {
-    passId: pass.id,
-    visitorName: pass.visitorName,
-    timestamp: log.timestamp,
-    message: `Your visitor, ${pass.visitorName}, has successfully exited the estate.`,
-  });
-
-  res.json({ success: true, log });
-};
-
-export const visitorsInside = async (req, res) => {
-  const passes = await prisma.visitorPass.findMany({
-    where: { status: 'INSIDE' },
-    include: {
-      resident: { select: residentSelect },
-      logs: { where: { action: 'IN' }, orderBy: { timestamp: 'desc' }, take: 1 },
-    },
-  });
-
-  const now = Date.now();
-  const data = passes
-    .map((p) => {
-      const entryAt = p.logs[0]?.timestamp || p.updatedAt;
-      return {
-        passId: p.id,
-        visitorName: p.visitorName,
-        visitorPhone: p.visitorPhone,
-        resident: p.resident.fullName,
-        residentPhone: p.resident.phoneNumber,
-        houseNumber: p.resident.houseNumber,
-        entryAt,
-        minutesInside: Math.floor((now - new Date(entryAt).getTime()) / 60000),
-      };
-    })
-    .sort((a, b) => new Date(a.entryAt) - new Date(b.entryAt));
-
-  res.json({ success: true, count: data.length, data });
-};
-
-export const createWalkIn = async (req, res) => {
-  const { visitorName, visitorPhone, purpose, houseNumber } = req.body;
-  if (!visitorName || !visitorPhone || !houseNumber) {
-    return res.status(400).json({
-      success: false,
-      message: 'visitorName, visitorPhone and houseNumber are required',
-    });
-  }
-
-  if (await isBlocked(visitorPhone)) {
-    return res.status(403).json({ success: false, reason: 'blocked' });
-  }
-
-  const residents = await prisma.user.findMany({
-    where: { houseNumber: String(houseNumber).trim(), role: 'RESIDENT', isActive: true },
-    select: { id: true },
-  });
-  if (!residents.length) {
-    return res.status(404).json({ success: false, message: 'No active resident found for that house' });
-  }
-
-  const now = new Date();
-  const pass = await prisma.visitorPass.create({
-    data: {
-      residentId: residents[0].id,
-      visitorName: String(visitorName).trim(),
-      visitorPhone: normPhone(visitorPhone),
-      purpose: purpose ? `Walk-in: ${purpose}` : 'Walk-in',
-      visitDateTime: now,
-      qrToken: `WALKIN-${crypto.randomBytes(12).toString('hex')}`,
-      status: 'PENDING',
-      expiresAt: new Date(now.getTime() + WALKIN_TTL_MINUTES * 60000),
-    },
-  });
-
-  residents.forEach((r) =>
-    notify(req, r.id, 'walkin:request', {
+    notify(req, pass.residentId, 'arrival:request', {
       passId: pass.id,
       visitorName: pass.visitorName,
-      purpose: pass.purpose,
-      expiresAt: pass.expiresAt,
-    })
-  );
+      message: `Your visitor, ${pass.visitorName}, has arrived at the estate entrance. Do you authorize entry?`,
+    });
 
-  res.status(201).json({ success: true, passId: pass.id, status: pass.status, expiresAt: pass.expiresAt });
-};
-
-export const getWalkIn = getApprovalStatus;
-
-export const dashboard = async (req, res) => {
-  const start = startOfTodayLagos();
-  const [visitorsToday, inside, completedExits, awaitingApproval, expected] = await Promise.all([
-    prisma.accessLog.count({ where: { action: 'IN', timestamp: { gte: start } } }),
-    prisma.visitorPass.count({ where: { status: 'INSIDE' } }),
-    prisma.accessLog.count({ where: { action: 'OUT', timestamp: { gte: start } } }),
-    prisma.visitorPass.count({ where: { status: 'PENDING', expiresAt: { gt: new Date() } } }),
-    prisma.visitorPass.count({ where: { status: 'ACTIVE', expiresAt: { gt: new Date() } } }),
-  ]);
-
-  res.json({
-    success: true,
-    data: { visitorsToday, insideNow: inside, completedExits, awaitingApproval, expected },
-  });
-};
-
-export const history = async (req, res) => {
-  const { name, phone, house, date, action } = req.query;
-  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-  const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
-
-  const where = {};
-  if (name) where.visitorName = { contains: String(name).trim(), mode: 'insensitive' };
-  if (action === 'IN' || action === 'OUT') where.action = action;
-  if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    where.timestamp = {
-      gte: new Date(`${date}T00:00:00+01:00`),
-      lt: new Date(new Date(`${date}T00:00:00+01:00`).getTime() + 86400000),
-    };
+    res.json({ success: true, status: 'PENDING' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
-  const passWhere = {};
-  if (phone) passWhere.visitorPhone = { contains: last10(phone) };
-  if (house) passWhere.resident = { houseNumber: String(house).trim() };
-  if (Object.keys(passWhere).length) where.pass = passWhere;
+};
 
-  const [data, total] = await Promise.all([
-    prisma.accessLog.findMany({
-      where,
-      include: {
-        pass: { select: { visitorPhone: true, purpose: true, resident: { select: residentSelect } } },
-        guard: { select: { fullName: true } },
-      },
-      orderBy: { timestamp: 'desc' },
-      skip: (page - 1) * limit,
-      take: limit,
-    }),
-    prisma.accessLog.count({ where }),
-  ]);
+// 3. POLL APPROVAL STATUS
+export const getApprovalStatus = async (req, res) => {
+  try {
+    const pass = await prisma.visitorPass.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, status: true, validTo: true, isWalkIn: true },
+    });
+    if (!pass) return res.status(404).json({ success: false, message: 'Pass not found' });
 
-  res.json({ success: true, page, limit, total, data });
+    if (pass.status === 'PENDING' && pass.validTo < new Date()) {
+      const nextStatus = pass.isWalkIn ? 'TIMED_OUT' : 'EXPIRED';
+      await prisma.visitorPass.update({ where: { id: pass.id }, data: { status: nextStatus } });
+      pass.status = nextStatus;
+    }
+
+    res.json({ success: true, status: pass.status });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// 4. CONFIRM ENTRY (Atomic single-use check-in)
+export const confirmEntry = async (req, res) => {
+  try {
+    const estate = await getDefaultEstate();
+    const pass = await prisma.visitorPass.findUnique({
+      where: { id: String(req.body.passId || '') },
+      include: { resident: { select: residentSelect } },
+    });
+    if (!pass) return res.status(404).json({ success: false, message: 'Pass not found' });
+
+    const reason = await evaluatePass(pass, estate.id);
+    if (reason) return res.status(422).json({ success: false, valid: false, reason });
+
+    if (pass.status === 'PENDING') {
+      return res.status(403).json({
+        success: false,
+        reason: 'AWAITING_APPROVAL',
+        message: 'Resident has not approved this visitor yet',
+      });
+    }
+
+    const log = await prisma.$transaction(async (tx) => {
+      const claimed = await tx.visitorPass.updateMany({
+        where: { id: pass.id, status: 'ACTIVE' },
+        data: { status: 'INSIDE' },
+      });
+      if (claimed.count === 0) return null;
+
+      return tx.accessLog.create({
+        data: {
+          passId: pass.id,
+          guardId: req.user.id,
+          visitorName: pass.visitorName,
+          visitorPhone: pass.visitorPhone,
+          gateName: req.body.gateName || 'Main Gate',
+          action: 'IN',
+        },
+      });
+    });
+
+    if (!log) return res.status(409).json({ success: false, reason: 'ALREADY_USED' });
+
+    notify(req, pass.residentId, 'visitor:entered', {
+      passId: pass.id,
+      visitorName: pass.visitorName,
+      timestamp: log.timestamp,
+    });
+
+    res.status(201).json({ success: true, log });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// 5. LOG EXIT FROM "INSIDE NOW" LIST
+export const logExit = async (req, res) => {
+  try {
+    const pass = await prisma.visitorPass.findUnique({ where: { id: req.params.passId } });
+    if (!pass) return res.status(404).json({ success: false, message: 'Pass not found' });
+
+    const log = await prisma.$transaction(async (tx) => {
+      const claimed = await tx.visitorPass.updateMany({
+        where: { id: pass.id, status: 'INSIDE' },
+        data: { status: 'EXITED' },
+      });
+      if (claimed.count === 0) return null;
+
+      return tx.accessLog.create({
+        data: {
+          passId: pass.id,
+          guardId: req.user.id,
+          visitorName: pass.visitorName,
+          visitorPhone: pass.visitorPhone,
+          gateName: req.body.gateName || 'Main Gate',
+          action: 'OUT',
+        },
+      });
+    });
+
+    if (!log) {
+      return res.status(409).json({
+        success: false,
+        message: 'This visitor is not currently inside the estate',
+      });
+    }
+
+    notify(req, pass.residentId, 'visitor:exited', {
+      passId: pass.id,
+      visitorName: pass.visitorName,
+      timestamp: log.timestamp,
+      message: `Your visitor, ${pass.visitorName}, has successfully exited the estate.`,
+    });
+
+    res.json({ success: true, log });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// 6. VISITORS CURRENTLY INSIDE OR TODAY'S ENTRIES
+export const visitorsInside = async (req, res) => {
+  try {
+    if (req.query.tab === 'today') {
+const todayLogs = await prisma.accessLog.findMany({
+where: { action: 'IN', timestamp: { gte: startOfTodayLagos() } },
+orderBy: { timestamp: 'desc' },
+});
+return res.json({ success: true, count: todayLogs.length, data: todayLogs });
+}
+const passes = await prisma.visitorPass.findMany({
+where: { status: 'INSIDE' },
+include: {
+resident: { select: residentSelect },
+logs: { where: { action: 'IN' }, orderBy: { timestamp: 'desc' }, take: 1 },
+},
+});
+const now = Date.now();
+const data = passes
+.map((p) => {
+const entryAt = p.logs?.timestamp || p.updatedAt;
+return {
+passId: p.id,
+visitorName: p.visitorName,
+visitorPhone: p.visitorPhone,
+resident: p.resident.fullName,
+residentPhone: p.resident.phoneNumber,
+houseNumber: p.resident.houseNumber,
+entryAt,
+minutesInside: Math.floor((now - new Date(entryAt).getTime()) / 60000),
+};
+})
+.sort((a, b) => new Date(a.entryAt) - new Date(b.entryAt));
+res.json({ success: true, count: data.length, data });
+} catch (error) {
+res.status(500).json({ success: false, message: error.message });
+}
+};
+// 7. CREATE WALK-IN VISITOR REQUEST (60s timeout)
+export const createWalkIn = async (req, res) => {
+try {
+const { visitorName, visitorPhone, purpose, houseNumber } = req.body;
+if (!visitorName || !visitorPhone || !houseNumber) {
+return res.status(400).json({
+success: false,
+message: 'visitorName, visitorPhone and houseNumber are required',
+});
+}
+const estate = await getDefaultEstate();
+const normalizedPhone = normalizePhone(visitorPhone);
+const resident = await prisma.user.findFirst({
+where: {
+role: 'RESIDENT',
+houseNumber: { equals: String(houseNumber).trim(), mode: 'insensitive' },
+},
+});
+if (!resident) {
+return res.status(404).json({ success: false, message: 'No resident found for that house.' });
+}
+if (await isBlocked(normalizedPhone, resident.houseId)) {
+return res.status(403).json({ success: false, reason: 'BLOCKED', message: 'Visitor is blocked.' });
+}
+const now = new Date();
+const validTo = new Date(now.getTime() + WALKIN_TTL_SECONDS * 1000);
+const passCode = generatePassCode();
+const created = await prisma.visitorPass.create({
+data: {
+estateId: estate.id,
+residentId: resident.id,
+visitorName: visitorName.trim(),
+visitorPhone: normalizedPhone,
+purpose: purpose ? purpose.trim() : 'Walk-in visit',
+passCode,
+qrToken: 'TEMP_' + passCode,
+status: 'PENDING',
+visitDateTime: now,
+validFrom: now,
+validTo,
+isWalkIn: true,
+},
+});
+const qrToken = signQrPayload({
+passId: created.id,
+code: passCode,
+estateId: estate.id,
+validFrom: now.toISOString(),
+validTo: validTo.toISOString(),
+});
+const pass = await prisma.visitorPass.update({
+where: { id: created.id },
+data: { qrToken },
+});
+notify(req, resident.id, 'walkin:request', {
+passId: pass.id,
+visitorName: pass.visitorName,
+expiresInSeconds: WALKIN_TTL_SECONDS,
+message: Walk-in visitor ${pass.visitorName} is at the gate requesting entry.,
+});
+res.status(201).json({ success: true, pass });
+} catch (error) {
+res.status(500).json({ success: false, message: error.message });
+}
 };
