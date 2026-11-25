@@ -17,6 +17,8 @@ enum PassStatus {
   PENDING
   ACTIVE
   REJECTED
+  CANCELLED
+  TIMED_OUT
   INSIDE
   EXITED
   EXPIRED
@@ -27,35 +29,80 @@ enum AccessAction {
   OUT
 }
 
-model User {
-  id           String           @id @default(uuid())
-  fullName     String
-  phoneNumber  String           @unique
-  houseNumber  String?
-  password     String
-  role         Role             @default(RESIDENT)
-  isActive     Boolean          @default(true)
-  otpCode      String?
-  otpExpires   DateTime?
-  createdAt    DateTime         @default(now())
-  updatedAt    DateTime         @updatedAt
+enum BlockScope {
+  HOUSE
+  ESTATE
+}
 
-  passes       VisitorPass[]    @relation("ResidentPasses")
-  guardLogs    AccessLog[]      @relation("GuardLogs")
-  blockedUsers BlockedVisitor[] @relation("AdminBlocked")
+model Estate {
+  id                            String           @id @default(uuid())
+  name                          String           @default("Estate Access Pilot Community")
+  passExpiryHours               Int              @default(4)
+  walkInTimeoutSeconds          Int              @default(60)
+  requireResidentApprovalAtGate Boolean          @default(false)
+  estateRules                   String[]         @default(["All visitors must present a valid QR pass at the Main Gate.", "Delivery riders are restricted to designated drop-off hours (7:00 AM - 9:00 PM).", "Speed limit within the estate is 20 km/h."])
+  notificationsEnabled          Boolean          @default(true)
+  createdAt                     DateTime         @default(now())
+
+  houses                        House[]
+  users                         User[]
+  passes                        VisitorPass[]
+  blockedVisitors               BlockedVisitor[]
+}
+
+model House {
+  id              String           @id @default(uuid())
+  estateId        String
+  estate          Estate           @relation(fields: [estateId], references: [id])
+  label           String           // Free text e.g. "Block A, House 12"
+  createdAt       DateTime         @default(now())
+
+  residents       User[]
+  blockedVisitors BlockedVisitor[]
+
+  @@unique([estateId, label])
+}
+
+model User {
+  id              String           @id @default(uuid())
+  estateId        String?
+  estate          Estate?          @relation(fields: [estateId], references: [id])
+  houseId         String?
+  house           House?           @relation(fields: [houseId], references: [id])
+  fullName        String
+  phoneNumber     String           @unique
+  email           String?          @unique
+  houseNumber     String?
+  password        String
+  role            Role             @default(RESIDENT)
+  isActive        Boolean          @default(true)
+  otpCode         String?
+  otpExpires      DateTime?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  passes          VisitorPass[]    @relation("ResidentPasses")
+  guardLogs       AccessLog[]      @relation("GuardLogs")
+  blockedVisitors BlockedVisitor[] @relation("BlockedByUser")
+  auditLogs       AuditLog[]       @relation("AdminAudits")
 }
 
 model VisitorPass {
   id            String       @id @default(uuid())
+  estateId      String
+  estate        Estate       @relation(fields: [estateId], references: [id])
   residentId    String
   resident      User         @relation("ResidentPasses", fields: [residentId], references: [id])
   visitorName   String
   visitorPhone  String
   purpose       String
-  visitDateTime DateTime
+  passCode      String       @unique
   qrToken       String       @unique
   status        PassStatus   @default(ACTIVE)
-  expiresAt     DateTime
+  visitDateTime DateTime
+  validFrom     DateTime
+  validTo       DateTime
+  isWalkIn      Boolean      @default(false)
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
 
@@ -63,32 +110,41 @@ model VisitorPass {
 }
 
 model AccessLog {
-  id          String       @id @default(uuid())
-  passId      String
-  pass        VisitorPass  @relation(fields: [passId], references: [id])
-  guardId     String
-  guard       User         @relation("GuardLogs", fields: [guardId], references: [id])
-  visitorName String
-  gateName    String       @default("Main Gate")
-  action      AccessAction @default(IN)
-  timestamp   DateTime     @default(now())
+  id             String       @id @default(uuid())
+  passId         String?
+  pass           VisitorPass? @relation(fields: [passId], references: [id])
+  guardId        String
+  guard          User         @relation("GuardLogs", fields: [guardId], references: [id])
+  visitorName    String
+  visitorPhone   String?
+  gateName       String       @default("Main Gate")
+  action         AccessAction @default(IN)
+  idempotencyKey String?      @unique
+  isOfflineSync  Boolean      @default(false)
+  flaggedAlert   Boolean      @default(false)
+  timestamp      DateTime     @default(now())
 }
 
 model BlockedVisitor {
-  id          String   @id @default(uuid())
+  id          String     @id @default(uuid())
+  estateId    String
+  estate      Estate     @relation(fields: [estateId], references: [id])
+  houseId     String?
+  house       House?     @relation(fields: [houseId], references: [id])
   fullName    String
-  phoneNumber String   @unique
-  reason      String   @default("Security violation")
+  phoneNumber String
+  reason      String     @default("Security violation")
+  scope       BlockScope @default(ESTATE)
   blockedById String?
-  blockedBy   User?    @relation("AdminBlocked", fields: [blockedById], references: [id])
-  blockedDate DateTime @default(now())
+  blockedBy   User?      @relation("BlockedByUser", fields: [blockedById], references: [id])
+  blockedDate DateTime   @default(now())
 }
 
-model EstateSetting {
-  id                            Int      @id @default(1)
-  estateName                    String   @default("Estate Access Community")
-  passExpiryHours               Int      @default(2)
-  requireResidentApprovalAtGate Boolean  @default(false)
-  estateRules                   String[] @default(["All visitors must present a valid QR pass at the Main Gate.", "Delivery riders are restricted to designated drop-off hours (7:00 AM - 9:00 PM).", "Speed limit within the estate is 20 km/h."])
-  notificationsEnabled          Boolean  @default(true)
+model AuditLog {
+  id          String   @id @default(uuid())
+  adminId     String
+  admin       User     @relation("AdminAudits", fields: [adminId], references: [id])
+  action      String
+  searchQuery String?
+  timestamp   DateTime @default(now())
 }
