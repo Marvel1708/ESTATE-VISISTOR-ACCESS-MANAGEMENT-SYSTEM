@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 
+
 import authRoutes from './src/routes/authRoutes.js';
 import residentRoutes from './src/routes/residentRoutes.js';
 import guardRoutes from './src/routes/guardRoutes.js';
@@ -15,6 +16,7 @@ app.use(express.json());
 app.get('/', (req, res) => {
   res.json({ message: 'Estate Access API is running!' });
 });
+
 
 app.use('/api/auth', authRoutes);
 app.use('/api/resident', residentRoutes);

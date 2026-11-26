@@ -35,5 +35,5 @@ router.delete('/blocked-visitors/:id', removeBlocked);
 router.get('/settings', getSettings);
 router.put('/settings', updateSettings);
 
->>>>>>> e66848eb3786c5d1fda4e0e3be9240df8cef3771
+
 export default router;

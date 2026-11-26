@@ -102,6 +102,11 @@ export const login = async (req, res) => {
       return res.status(401).json({ message: 'Invalid phone number or password.' });
     }
 
+ const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(401).json({ message: 'Invalid phone number or password.' });
+    }
+
     res.json({
       message: 'Login successful!',
       token: createToken(user),
@@ -113,9 +118,11 @@ export const login = async (req, res) => {
         role: user.role,
       },
     });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
+  } 
+   catch (error) {
+  console.error('Login error:', error.message);
+  res.status(500).json({ message: 'Unable to connect please check your internet and try again.' });
+   }
 };
 
 // 3. SEND OTP
@@ -214,7 +221,36 @@ export const resetPassword = async (req, res) => {
       },
     });
 
-    res.json({ message: 'Password reset successful! You can now log in with your new password.' });
+    res.json({ message: 'Password reset successful!' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// 6. CHANGE PASSWORD (For logged-in users in Settings)
+export const changePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword, confirmPassword } = req.body;
+
+    if (!currentPassword || !newPassword || newPassword.length < 6) {
+      return res.status(400).json({ message: 'Current password and a new password (min 6 chars) are required.' });
+    }
+
+    if (confirmPassword && newPassword !== confirmPassword) {
+      return res.status(400).json({ message: 'New passwords do not match.' });
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    if (!user || !(await bcrypt.compare(currentPassword, user.password))) {
+      return res.status(401).json({ message: 'Current password is incorrect.' });
+    }
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { password: await bcrypt.hash(newPassword, 10) },
+    });
+
+    res.json({ message: 'Password updated successfully!' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

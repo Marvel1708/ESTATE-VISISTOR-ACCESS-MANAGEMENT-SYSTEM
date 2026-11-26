@@ -215,7 +215,7 @@ export const getApprovalStatus = async (req, res) => {
   }
 };
 
-// 4. CONFIRM ENTRY (Atomic single-use check-in)
+// 4. CONFIRM ENTRY 
 export const confirmEntry = async (req, res) => {
   try {
     const estate = await getDefaultEstate();
@@ -410,7 +410,7 @@ notify(req, resident.id, 'walkin:request', {
 passId: pass.id,
 visitorName: pass.visitorName,
 expiresInSeconds: WALKIN_TTL_SECONDS,
-message: Walk-in visitor ${pass.visitorName} is at the gate requesting entry.,
+message: `Walk-in visitor ${pass.visitorName} is at the gate requesting entry.`,
 });
 res.status(201).json({ success: true, pass });
 } catch (error) {
