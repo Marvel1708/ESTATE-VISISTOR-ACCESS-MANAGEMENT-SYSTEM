@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import swaggerUi from 'swagger-ui-express';
+import { specs } from './src/config/swagger.js';
 
 
 import authRoutes from './src/routes/authRoutes.js';
@@ -17,7 +19,7 @@ app.get('/', (req, res) => {
   res.json({ message: 'Estate Access API is running!' });
 });
 
-
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(specs));
 app.use('/api/auth', authRoutes);
 app.use('/api/resident', residentRoutes);
 app.use('/api/guard', guardRoutes);

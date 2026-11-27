@@ -86,6 +86,20 @@ export const register = async (req, res) => {
   }
 };
 
+
+// Dedicated Resident Registration (/api/auth/register/resident)
+export const registerResident = async (req, res) => {
+  req.body.role = 'RESIDENT';
+  return register(req, res);
+};
+
+// Dedicated Admin Registration (/api/auth/register/admin)
+export const registerAdmin = async (req, res) => {
+  req.body.role = 'ADMIN';
+  return register(req, res);
+}
+
+
 // 2. LOGIN (Works for Resident, Admin, and Guard — no secret code needed)
 export const login = async (req, res) => {
   try {

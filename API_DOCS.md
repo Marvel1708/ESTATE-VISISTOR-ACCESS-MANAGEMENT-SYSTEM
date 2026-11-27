@@ -16,7 +16,8 @@
 
 | Method | Endpoint | Access | Request Body (JSON) |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/api/auth/register` | Public | `{ "fullName", "phoneNumber", "password", "houseNumber?", "role?", "adminCode?" }` |
+| `POST` | `/api/auth/registerResident` | Public | `{ "fullName", "phoneNumber", "password" "houseNumber?" }` |
+| `POST` | `/api/auth/register/admin` | Public | `{ "fullName", "phoneNumber", "password", "adminCode" }` |
 | `POST` | `/api/auth/login` | Public | `{ "phoneNumber", "password" }` |
 | `POST` | `/api/auth/otp/send` | Public | `{ "phoneNumber" }` |
 | `POST` | `/api/auth/otp/verify` | Public | `{ "phoneNumber", "otpCode" }` |
